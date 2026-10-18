@@ -36,7 +36,7 @@ OpenAI の **GPT-Live** (`gpt-live-1`) で声で会話し、**Decisions API** (`
 - `--trace` を付けると、調整用に会話の音と時刻を `bridge/eval/sessions/` に残します (Git には入りません)
 
 ## はじめかた
-> Claude Code にこのリポジトリを渡して「スタックチャンのセットアップをして」と頼めるセットアップ Skill を近日追加します (`.claude/skills/stackchan-pet-setup/`)
+> **Claude Code を使う場合**: このリポジトリを clone して Claude Code を開き、「スタックチャンのセットアップをして」と頼むと、セットアップ Skill (`.claude/skills/stackchan-pet-setup/SKILL.md`) に沿って、費用と音の扱いの説明 → 開発環境 → 工場ファームのバックアップ → 書き込み → API キー → 会話の確認 まで順に進めます。USB をつなぐ・キーを書くなど人の手が要る所は Claude Code が頼みます
 
 ```sh
 git clone <このリポジトリ>

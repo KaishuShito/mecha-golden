@@ -1,0 +1,19 @@
+.env
+.arduino/
+.venv/
+build/
+build_v1/
+build_v2/
+__pycache__/
+*.pyc
+.DS_Store
+# 会話の記録・ログ (人の声が入る)
+bridge/logs/
+bridge/eval/sessions/
+bridge/eval/ab-*/
+bridge/bridge.log
+bridge/bridge.pid
+bridge/greeting_*.pcm
+bridge/*.wav
+# 工場ファームのバックアップ (Wi-Fi などの設定が入る)
+backup/

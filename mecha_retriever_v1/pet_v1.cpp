@@ -1,0 +1,735 @@
+// メカ・ゴールデンレトリバー (StackChan / M5Stack CoreS3 用デジタルペット) — 10/16 12:46 の段階
+// (最初に画面に出た時点。会話・Wi-Fi・カメラ・首の動きは入っていない)
+// 絵はすべてコードで描いている (外部画像なし)。
+// 状態の種類は Codex Pets の 9 行 (idle / waving / jumping / waiting / running / review / failed) を参考にした。
+// サーボ (首) はこのスケッチでは動かさない。
+
+#include <Arduino.h>
+#include <M5StackChan.h>
+#include <math.h>
+
+static constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static uint16_t mix(uint16_t a, uint16_t b, float t)
+{
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    int ar = (a >> 11) & 31, ag = (a >> 5) & 63, ab = a & 31;
+    int br = (b >> 11) & 31, bg = (b >> 5) & 63, bb = b & 31;
+    return (uint16_t)((int(ar + (br - ar) * t) << 11) | (int(ag + (bg - ag) * t) << 5) | int(ab + (bb - ab) * t));
+}
+
+namespace C {
+constexpr uint16_t BG_TOP  = rgb(16, 22, 44);
+constexpr uint16_t BG_BOT  = rgb(40, 52, 92);
+constexpr uint16_t FLOOR   = rgb(52, 64, 104);
+constexpr uint16_t FLOOR_L = rgb(70, 84, 128);
+constexpr uint16_t DOT     = rgb(48, 66, 110);
+constexpr uint16_t SHADOW  = rgb(30, 36, 64);
+constexpr uint16_t OUTLINE = rgb(74, 42, 18);
+constexpr uint16_t FUR     = rgb(232, 166, 72);
+constexpr uint16_t FUR_L   = rgb(250, 210, 136);
+constexpr uint16_t FUR_D   = rgb(196, 124, 46);
+constexpr uint16_t METAL   = rgb(164, 176, 190);
+constexpr uint16_t METAL_L = rgb(226, 232, 240);
+constexpr uint16_t METAL_D = rgb(92, 102, 118);
+constexpr uint16_t METAL_O = rgb(44, 50, 64);
+constexpr uint16_t CYAN    = rgb(70, 236, 255);
+constexpr uint16_t CYAN_D  = rgb(18, 70, 100);
+constexpr uint16_t EYE     = rgb(28, 24, 36);
+constexpr uint16_t WHITE   = rgb(255, 255, 255);
+constexpr uint16_t NOSE    = rgb(40, 30, 32);
+constexpr uint16_t MOUTH   = rgb(120, 34, 44);
+constexpr uint16_t TONGUE  = rgb(255, 122, 142);
+constexpr uint16_t TONGUE_D= rgb(214, 78, 100);
+constexpr uint16_t BLUSH   = rgb(255, 146, 140);
+constexpr uint16_t RED     = rgb(255, 84, 96);
+constexpr uint16_t PINK    = rgb(255, 112, 168);
+constexpr uint16_t SWEAT   = rgb(130, 206, 255);
+constexpr uint16_t TEXT    = rgb(232, 238, 252);
+constexpr uint16_t PILL    = rgb(28, 38, 70);
+constexpr uint16_t YELLOW  = rgb(255, 226, 90);
+constexpr uint16_t TRANSP  = rgb(255, 0, 255);
+}  // namespace C
+
+static M5Canvas canvas(&M5.Display);
+static M5Canvas bg(&M5.Display);
+static M5Canvas head(&canvas);
+
+static constexpr int W = 320, H = 240;
+static constexpr int HW = 200, HH = 176, HX = 100, HY = 86;  // 頭スプライトと、その中の頭の中心
+
+enum State : uint8_t { IDLE, WAVING, JUMPING, WAITING, WORKING, REVIEW, FAILED, PETTED, STATE_COUNT };
+struct StateInfo {
+    const char* id;
+    const char* label;
+    uint32_t dur;
+};
+static const StateInfo INFO[STATE_COUNT] = {
+    {"idle", "まったり", 0},          {"waving", "やっほー!", 2600},  {"jumping", "ジャンプ!", 1900},
+    {"waiting", "なになに?", 4200},   {"running", "おしごと中", 5000}, {"review", "チェック中", 4200},
+    {"failed", "しっぱい…", 3200},    {"petted", "なでなで!", 3000},
+};
+
+enum Eyes : uint8_t { EYE_NORMAL, EYE_BLINK, EYE_HAPPY, EYE_VISOR, EYE_NARROW, EYE_SAD };
+struct Face {
+    float lookX = 0, lookY = 0;
+    Eyes eyes = EYE_NORMAL;
+    bool mouthOpen = false, tongue = false, sadMouth = false, browUp = false;
+    float earA = 0.22f, earDrop = 0, blush = 0.5f, scan = 0, pant = 0, antennaWob = 0;
+    uint16_t antenna = C::CYAN;
+    uint8_t ledPhase = 0;
+};
+
+struct Particle {
+    float x, y, vx, vy;
+    uint32_t born;
+    bool alive;
+};
+static Particle parts[8];
+
+static State state = IDLE;
+static uint32_t stateStart = 0, nextAuto = 0, nextBlink = 0, blinkUntil = 0, nextLook = 0, lookHold = 0;
+static uint32_t lastSpawn = 0, lastLed = 0, frames = 0, fpsT = 0;
+static float lookX = 0, lookY = 0, lookTX = 0, lookTY = 0;
+
+static void setState(State s)
+{
+    state      = s;
+    stateStart = millis();
+    if (s == IDLE) nextAuto = millis() + random(7000, 13000);
+    Serial.printf("[state] %s\n", INFO[s].id);
+}
+
+// 回転した楕円を三角形の扇で塗る
+static void rotEllipse(LovyanGFX& g, float cx, float cy, float rx, float ry, float a, uint16_t c)
+{
+    constexpr int N = 22;
+    const float ca = cosf(a), sa = sinf(a);
+    float px[N], py[N];
+    for (int i = 0; i < N; i++) {
+        const float th = i * 2 * PI / N, x = rx * cosf(th), y = ry * sinf(th);
+        px[i] = cx + x * ca - y * sa;
+        py[i] = cy + x * sa + y * ca;
+    }
+    for (int i = 0; i < N; i++) {
+        const int j = (i + 1) % N;
+        g.fillTriangle(lroundf(cx), lroundf(cy), lroundf(px[i]), lroundf(py[i]), lroundf(px[j]), lroundf(py[j]), c);
+    }
+}
+
+static void oEllipse(LovyanGFX& g, int x, int y, int rx, int ry, uint16_t c, int ol = 2)
+{
+    g.fillEllipse(x, y, rx + ol, ry + ol, C::OUTLINE);
+    g.fillEllipse(x, y, rx, ry, c);
+}
+
+static void oRoundRect(LovyanGFX& g, int x, int y, int w, int h, int r, uint16_t c, uint16_t ol = C::OUTLINE)
+{
+    g.fillRoundRect(x - 2, y - 2, w + 4, h + 4, r + 2, ol);
+    g.fillRoundRect(x, y, w, h, r, c);
+}
+
+static void heart(LovyanGFX& g, int x, int y, int s, uint16_t c)
+{
+    g.fillCircle(x - s / 2, y - s / 4, s / 2 + 1, c);
+    g.fillCircle(x + s / 2, y - s / 4, s / 2 + 1, c);
+    g.fillTriangle(x - s - 1, y - s / 8, x + s + 1, y - s / 8, x, y + s, c);
+}
+
+static void sparkle(LovyanGFX& g, int x, int y, int s, uint16_t c)
+{
+    g.fillTriangle(x - s, y, x + s, y, x, y - s * 2, c);
+    g.fillTriangle(x - s, y, x + s, y, x, y + s * 2, c);
+    g.fillTriangle(x, y - s, x, y + s, x - s * 2, y, c);
+    g.fillTriangle(x, y - s, x, y + s, x + s * 2, y, c);
+}
+
+/* ---------------------------------------------------------------- 背景 */
+static void buildBackground()
+{
+    for (int y = 0; y < H; y++) bg.drawFastHLine(0, y, W, mix(C::BG_TOP, C::BG_BOT, y / 214.0f));
+    for (int y = 14; y < 206; y += 24)
+        for (int x = 12 + ((y / 24) % 2) * 12; x < W; x += 24) bg.fillCircle(x, y, 1, C::DOT);
+    bg.fillRect(0, 214, W, H - 214, C::FLOOR);
+    bg.drawFastHLine(0, 214, W, C::FLOOR_L);
+    for (int i = -6; i <= 6; i++) bg.drawLine(160 + i * 18, 214, 160 + i * 60, H, C::FLOOR_L);
+}
+
+/* ---------------------------------------------------------------- 頭 (head スプライトに描く) */
+static void drawEye(LovyanGFX& g, int ex, int ey, const Face& f, bool left)
+{
+    switch (f.eyes) {
+        case EYE_NORMAL:
+        case EYE_SAD: {
+            const int x = ex + lroundf(f.lookX * 4);
+            const int y = ey + lroundf(f.lookY * 3) + (f.eyes == EYE_SAD ? 3 : 0);
+            g.fillEllipse(x, y, 11, 14, C::EYE);
+            g.fillCircle(x + 4, y - 6, 4, C::WHITE);
+            g.fillCircle(x - 4, y + 6, 2, C::CYAN);
+            if (f.eyes == EYE_SAD) {
+                for (int k = 0; k < 3; k++) {
+                    if (left) g.drawLine(ex - 11, ey - 15 + k, ex + 9, ey - 22 + k, C::OUTLINE);
+                    else g.drawLine(ex - 9, ey - 22 + k, ex + 11, ey - 15 + k, C::OUTLINE);
+                }
+            }
+            break;
+        }
+        case EYE_BLINK:
+            g.fillRoundRect(ex - 11, ey, 22, 4, 2, C::EYE);
+            break;
+        case EYE_HAPPY:
+            g.fillArc(ex, ey + 6, 9, 13, 200, 340, C::EYE);
+            break;
+        case EYE_NARROW: {
+            const int x = ex + lroundf(f.lookX * 5);
+            g.fillEllipse(x, ey + 3, 11, 7, C::EYE);
+            g.fillCircle(x + 4, ey + 1, 2, C::WHITE);
+            g.fillRect(ex - 13, ey - 6, 26, 5, C::FUR);
+            g.fillRect(ex - 13, ey - 2, 26, 2, C::OUTLINE);
+            if (f.browUp && !left) {
+                for (int k = 0; k < 3; k++) g.drawLine(ex - 9, ey - 16 + k, ex + 10, ey - 21 + k, C::OUTLINE);
+            }
+            break;
+        }
+        case EYE_VISOR:
+            break;
+    }
+}
+
+static void drawEar(LovyanGFX& g, float px, float py, float a, float drop, bool left)
+{
+    const float ry = 34, rx = 18;
+    const float ang = left ? a : -a;
+    const float cx = px - 0.8f * ry * sinf(ang);
+    const float cy = py + 0.8f * ry * cosf(ang) + drop;
+    rotEllipse(g, cx, cy, rx + 2, ry + 2, ang, C::OUTLINE);
+    rotEllipse(g, cx, cy, rx, ry, ang, C::FUR_D);
+    rotEllipse(g, cx + (left ? 3 : -3), cy - 4, rx - 8, ry - 12, ang, mix(C::FUR_D, C::FUR, 0.45f));
+}
+
+static void drawHead(const Face& f)
+{
+    LovyanGFX& g = head;
+    g.fillScreen(C::TRANSP);
+    const int hx = HX, hy = HY;
+
+    // アンテナ
+    const int ax0 = hx + 18, ay0 = hy - 56, ax1 = hx + 24 + lroundf(f.antennaWob), ay1 = hy - 76;
+    for (int k = -1; k <= 1; k++) g.drawLine(ax0 + k, ay0, ax1 + k, ay1, C::METAL_O);
+    g.fillCircle(ax1, ay1, 6, C::METAL_O);
+    g.fillCircle(ax1, ay1, 5, f.antenna);
+    g.fillCircle(ax1 - 2, ay1 - 2, 1, C::WHITE);
+
+    // 頭
+    oEllipse(g, hx, hy, 66, 56, C::FUR);
+    g.fillEllipse(hx, hy - 24, 30, 18, C::FUR_L);
+
+    // ヘルメットの板
+    oRoundRect(g, hx - 36, hy - 62, 72, 22, 10, C::METAL, C::METAL_O);
+    g.fillRoundRect(hx - 28, hy - 58, 40, 3, 1, C::METAL_L);
+    g.fillCircle(hx - 28, hy - 49, 2, C::METAL_D);
+    g.fillCircle(hx + 28, hy - 49, 2, C::METAL_D);
+    for (int i = 0; i < 3; i++) {
+        const bool on = (f.ledPhase % 3) == i;
+        g.fillCircle(hx - 12 + i * 12, hy - 49, 3, on ? C::CYAN : C::CYAN_D);
+    }
+
+    // 目
+    if (f.eyes == EYE_VISOR) {
+        g.fillRoundRect(hx - 46, hy - 22, 92, 28, 13, C::METAL_O);
+        g.fillRoundRect(hx - 42, hy - 18, 84, 20, 10, C::CYAN_D);
+        const int sx = hx - 34 + lroundf(f.scan * 68);
+        g.fillRoundRect(sx - 14, hy - 15, 28, 14, 6, mix(C::CYAN_D, C::CYAN, 0.35f));
+        g.fillRoundRect(sx - 6, hy - 15, 12, 14, 5, C::CYAN);
+    } else {
+        drawEye(g, hx - 27, hy - 6, f, true);
+        drawEye(g, hx + 27, hy - 6, f, false);
+    }
+
+    // ほっぺ
+    if (f.blush > 0.01f) {
+        const uint16_t b = mix(C::FUR, C::BLUSH, f.blush);
+        g.fillEllipse(hx - 44, hy + 18, 9, 5, b);
+        g.fillEllipse(hx + 44, hy + 18, 9, 5, b);
+    }
+
+    // マズルと口
+    g.fillEllipse(hx, hy + 24, 31, 22, C::FUR_L);
+    if (f.mouthOpen) {
+        g.fillArc(hx, hy + 22, 0, 14, 0, 180, C::OUTLINE);
+        g.fillArc(hx, hy + 22, 0, 12, 0, 180, C::MOUTH);
+        if (f.tongue) {
+            const int ty = hy + 30 + lroundf(f.pant);
+            g.fillEllipse(hx, ty, 8, 6, C::TONGUE);
+            g.drawFastVLine(hx, ty - 3, 6, C::TONGUE_D);
+        }
+        g.fillRect(hx - 1, hy + 18, 3, 5, C::NOSE);
+        g.fillRect(hx - 14, hy + 21, 29, 2, C::NOSE);
+    } else if (f.sadMouth) {
+        g.fillArc(hx, hy + 34, 6, 8, 200, 340, C::NOSE);
+    } else {
+        g.fillRect(hx - 1, hy + 18, 3, 7, C::NOSE);
+        g.fillArc(hx - 7, hy + 24, 6, 8, 0, 180, C::NOSE);
+        g.fillArc(hx + 7, hy + 24, 6, 8, 0, 180, C::NOSE);
+    }
+    g.fillEllipse(hx, hy + 12, 11, 8, C::NOSE);
+    g.fillEllipse(hx - 3, hy + 9, 4, 2, C::METAL_L);
+
+    // 耳とボルト
+    drawEar(g, hx - 50, hy - 30, f.earA, f.earDrop, true);
+    drawEar(g, hx + 50, hy - 30, f.earA, f.earDrop, false);
+    for (int s = -1; s <= 1; s += 2) {
+        const int bx = hx + s * 50, by = hy - 30;
+        g.fillCircle(bx, by, 8, C::METAL_O);
+        g.fillCircle(bx, by, 6, C::METAL);
+        g.fillCircle(bx - 2, by - 2, 2, C::METAL_L);
+        g.fillCircle(bx + 1, by + 1, 2, C::METAL_D);
+    }
+}
+
+/* ---------------------------------------------------------------- しっぽ */
+static void drawTail(LovyanGFX& g, float x, float y, float base, float wag, float phase)
+{
+    constexpr int N = 5;
+    float px[N + 1], py[N + 1];
+    float a = base;
+    px[0] = x;
+    py[0] = y;
+    for (int i = 0; i < N; i++) {
+        a += -0.16f + wag * sinf(phase - i * 0.6f) * 0.42f;
+        px[i + 1] = px[i] + cosf(a) * 11;
+        py[i + 1] = py[i] + sinf(a) * 11;
+    }
+    for (int i = 0; i <= N; i++) g.fillCircle(lroundf(px[i]), lroundf(py[i]), 10 - i * 0.5f, C::OUTLINE);
+    g.fillCircle(lroundf(px[N]), lroundf(py[N]), 12, C::OUTLINE);
+    for (int i = 0; i <= N; i++) g.fillCircle(lroundf(px[i]), lroundf(py[i]), 8 - i * 0.5f, i % 2 ? C::FUR : C::FUR_D);
+    g.fillCircle(lroundf(px[N]), lroundf(py[N]), 10, C::FUR_L);
+    for (int i = 0; i < N; i++) {
+        const int mx = lroundf((px[i] + px[i + 1]) / 2), my = lroundf((py[i] + py[i + 1]) / 2);
+        g.fillCircle(mx, my, 3, C::METAL_O);
+        g.fillCircle(mx, my, 2, C::METAL);
+    }
+}
+
+/* ---------------------------------------------------------------- 体 */
+static void drawPaw(LovyanGFX& g, int x, int y)
+{
+    oRoundRect(g, x, y, 24, 11, 5, C::METAL, C::METAL_O);
+    g.fillRect(x + 7, y + 4, 2, 7, C::METAL_D);
+    g.fillRect(x + 15, y + 4, 2, 7, C::METAL_D);
+    g.fillRect(x + 3, y + 2, 12, 2, C::METAL_L);
+}
+
+static void drawBody(float t, float by, float tailBase, float tailWag, float tailSpeed, bool wave, uint16_t core)
+{
+    LovyanGFX& g = canvas;
+    const int bx = 160, b = lroundf(by);
+
+    drawTail(g, bx + 40, 208 + b, tailBase, tailWag, t * tailSpeed);
+
+    oEllipse(g, bx - 44, 212 + b, 20, 13, C::FUR_D);
+    oEllipse(g, bx + 44, 212 + b, 20, 13, C::FUR_D);
+    oEllipse(g, bx, 186 + b, 48, 40, C::FUR);
+    g.fillEllipse(bx, 194 + b, 30, 28, C::FUR_L);
+
+    // 胸のプレートとコア
+    oRoundRect(g, bx - 20, 166 + b, 40, 30, 9, C::METAL, C::METAL_O);
+    g.fillRoundRect(bx - 15, 170 + b, 30, 3, 1, C::METAL_L);
+    g.fillCircle(bx - 15, 191 + b, 2, C::METAL_D);
+    g.fillCircle(bx + 15, 191 + b, 2, C::METAL_D);
+    g.fillCircle(bx, 182 + b, 10, C::METAL_O);
+    heart(g, bx, 182 + b, 7, core);
+
+    // 前足
+    oRoundRect(g, bx - 34, 196 + b, 20, 26, 9, C::FUR);
+    drawPaw(g, bx - 36, 216 + b);
+    if (!wave) {
+        oRoundRect(g, bx + 14, 196 + b, 20, 26, 9, C::FUR);
+        drawPaw(g, bx + 12, 216 + b);
+    }
+
+    // 首輪
+    oRoundRect(g, bx - 40, 144 + b, 80, 12, 6, C::METAL_D, C::METAL_O);
+    for (int i = -3; i <= 3; i++) g.fillCircle(bx + i * 11, 150 + b, 1, C::METAL_L);
+
+    if (wave) {
+        const float d = -0.55f + 0.4f * sinf(t * 2 * PI * 2.4f);
+        const float sx = bx + 30, sy = 186 + b;
+        const float cx = sx + cosf(d) * 16, cy = sy + sinf(d) * 16;
+        rotEllipse(g, cx, cy, 22, 12, d, C::OUTLINE);
+        rotEllipse(g, cx, cy, 20, 10, d, C::FUR);
+        const int px = lroundf(sx + cosf(d) * 34), py = lroundf(sy + sinf(d) * 34);
+        g.fillCircle(px, py, 12, C::METAL_O);
+        g.fillCircle(px, py, 10, C::METAL);
+        g.fillCircle(px - 3, py - 3, 3, C::METAL_L);
+        g.fillCircle(px + 2, py + 3, 2, C::METAL_D);
+    }
+}
+
+static void drawTag(int by)
+{
+    LovyanGFX& g = canvas;
+    const int x = 160, y = 162 + by;
+    g.fillCircle(x, y, 12, C::METAL_O);
+    g.fillCircle(x, y, 10, C::YELLOW);
+    g.setFont(&fonts::Font0);
+    g.setTextDatum(middle_center);
+    g.setTextColor(C::OUTLINE);
+    g.drawString("AGI", x + 1, y + 1);
+}
+
+/* ---------------------------------------------------------------- 飾り */
+static void drawGear(LovyanGFX& g, int x, int y, float a)
+{
+    for (int i = 0; i < 8; i++) {
+        const float th = a + i * PI / 4;
+        rotEllipse(g, x + cosf(th) * 15, y + sinf(th) * 15, 5, 4, th, C::METAL);
+    }
+    g.fillCircle(x, y, 14, C::METAL);
+    g.fillCircle(x, y, 6, C::PILL);
+}
+
+static void spawnHeart(float x, float y)
+{
+    for (auto& p : parts) {
+        if (!p.alive) {
+            p = {x, y, (float)random(-10, 11) / 20.0f, -0.9f - random(0, 6) / 10.0f, millis(), true};
+            return;
+        }
+    }
+}
+
+static void drawParticles()
+{
+    const uint32_t now = millis();
+    for (auto& p : parts) {
+        if (!p.alive) continue;
+        const uint32_t age = now - p.born;
+        if (age > 1500) {
+            p.alive = false;
+            continue;
+        }
+        p.x += p.vx;
+        p.y += p.vy;
+        heart(canvas, lroundf(p.x), lroundf(p.y), age > 1100 ? 5 : 7, mix(C::PINK, C::BG_TOP, age > 1100 ? (age - 1100) / 400.0f : 0));
+    }
+}
+
+static void drawLabel()
+{
+    canvas.setFont(&fonts::lgfxJapanGothic_16);
+    const int w = canvas.textWidth(INFO[state].label);
+    canvas.fillSmoothRoundRect(6, 6, w + 30, 24, 12, C::PILL);
+    canvas.fillSmoothCircle(19, 18, 4, state == FAILED ? C::RED : C::CYAN);
+    canvas.setTextDatum(middle_left);
+    canvas.setTextColor(C::TEXT);
+    canvas.drawString(INFO[state].label, 28, 19);
+}
+
+/* ---------------------------------------------------------------- LED (本体の 12 個) */
+static void updateLeds(float t)
+{
+    if (millis() - lastLed < 80) return;
+    lastLed = millis();
+    const float br = 0.55f + 0.45f * sinf(t * 2.2f);
+    for (int i = 0; i < 12; i++) {
+        uint8_t r = 0, g = 0, b = 0;
+        switch (state) {
+            case IDLE: r = 40 * br; g = 22 * br; b = 2; break;
+            case WAVING:
+            case JUMPING: {
+                const float h = fmodf(t * 1.5f + i / 12.0f, 1.0f) * 6;
+                const int k = (int)h;
+                const float f = h - k;
+                const uint8_t v = 40, q = v * (1 - f), u = v * f;
+                const uint8_t tbl[6][3] = {{v, u, 0}, {q, v, 0}, {0, v, u}, {0, q, v}, {u, 0, v}, {v, 0, q}};
+                r = tbl[k % 6][0]; g = tbl[k % 6][1]; b = tbl[k % 6][2];
+                break;
+            }
+            case WAITING: r = g = b = 22 * br; break;
+            case WORKING: {
+                const int pos = ((int)(t * 10)) % 6;
+                const bool on = (i % 6) == pos;
+                g = on ? 40 : 6; b = on ? 50 : 8;
+                break;
+            }
+            case REVIEW: g = 10; b = 40; break;
+            case FAILED: r = 30 * br; break;
+            case PETTED: r = 50 * br; g = 10 * br; b = 24 * br; break;
+            default: break;
+        }
+        M5StackChan.setRgbColor(i, r, g, b);
+    }
+    M5StackChan.refreshRgb();
+}
+
+/* ---------------------------------------------------------------- シリアル (確認用) */
+static void handleSerial()
+{
+    while (Serial.available()) {
+        const int c = Serial.read();
+        if (c == 'S') {
+            Serial.setTxTimeoutMs(500);
+            Serial.printf("SNAP %d %d %s\n", W, H, INFO[state].id);
+            Serial.flush();
+            const uint8_t* buf = (const uint8_t*)canvas.getBuffer();
+            const size_t n = W * H * 2;
+            for (size_t o = 0; o < n; o += 1024) {
+                Serial.write(buf + o, (n - o) < 1024 ? (n - o) : 1024);
+            }
+            Serial.flush();
+            Serial.print("\nENDSNAP\n");
+            Serial.setTxTimeoutMs(0);
+        } else if (c >= '0' && c < '0' + STATE_COUNT) {
+            setState((State)(c - '0'));
+        } else if (c == 'p') {
+            Serial.printf("[status] state=%s free_heap=%u psram=%u\n", INFO[state].id, ESP.getFreeHeap(), ESP.getFreePsram());
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- setup / loop */
+void setup()
+{
+    Serial.begin(115200);
+    Serial.setTxTimeoutMs(0);
+    M5StackChan.begin();
+    randomSeed(esp_random());
+
+    M5.Display.setRotation(1);
+    canvas.setColorDepth(16);
+    canvas.setPsram(true);
+    canvas.createSprite(W, H);
+    bg.setColorDepth(16);
+    bg.setPsram(true);
+    bg.createSprite(W, H);
+    head.setColorDepth(16);
+    head.setPsram(false);
+    if (!head.createSprite(HW, HH)) {
+        head.setPsram(true);
+        head.createSprite(HW, HH);
+    }
+    head.setPivot(HX, HY);
+    buildBackground();
+
+    setState(IDLE);
+    nextBlink = millis() + 1500;
+    Serial.println("[boot] mecha retriever ready (v1 10/16 12:46)");
+}
+
+void loop()
+{
+    M5StackChan.update();
+    handleSerial();
+
+    const uint32_t now = millis();
+    const float t = now / 1000.0f;
+    const uint32_t el = now - stateStart;
+
+    // 入力
+    auto td = M5.Touch.getDetail();
+    if (td.wasPressed()) {
+        const bool onHead = td.y < 150 && abs(td.x - 160) < 80;
+        setState(onHead ? PETTED : (random(2) ? WAVING : JUMPING));
+        Serial.printf("[touch] screen x=%d y=%d\n", td.x, td.y);
+    }
+    if (td.isPressed()) {
+        lookTX   = constrain((td.x - 160) / 70.0f, -1.f, 1.f);
+        lookTY   = constrain((td.y - 90) / 60.0f, -1.f, 1.f);
+        lookHold = now + 1500;
+        if (state == PETTED) stateStart = now;
+    }
+    auto& ts = M5StackChan.TouchSensor;
+    if (ts.wasClicked()) {
+        setState(PETTED);
+        Serial.println("[touch] head sensor click");
+    }
+    if (ts.wasSwipedForward() || ts.wasSwipedBackward()) {
+        setState(JUMPING);
+        Serial.println("[touch] head sensor swipe");
+    }
+
+    // 状態の切り替え
+    if (state != IDLE && el > INFO[state].dur) setState(IDLE);
+    if (state == IDLE && now > nextAuto) {
+        static const State pool[] = {WAVING, WAITING, WORKING, REVIEW, JUMPING, WAITING, WORKING, FAILED};
+        setState(pool[random(sizeof(pool) / sizeof(pool[0]))]);
+    }
+
+    // 視線
+    if (now > lookHold && now > nextLook) {
+        lookTX   = random(-10, 11) / 14.0f;
+        lookTY   = random(-6, 7) / 14.0f;
+        nextLook = now + random(1500, 4000);
+    }
+    lookX += (lookTX - lookX) * 0.18f;
+    lookY += (lookTY - lookY) * 0.18f;
+
+    // まばたき
+    if (now > nextBlink) {
+        blinkUntil = now + 130;
+        nextBlink  = now + random(2000, 5500);
+    }
+    const bool blinking = now < blinkUntil;
+
+    // 状態ごとの見た目
+    Face f;
+    f.lookX      = lookX;
+    f.lookY      = lookY;
+    f.earA       = 0.22f + 0.03f * sinf(t * 1.3f);
+    f.antennaWob = 2.0f * sinf(t * 2.0f);
+    f.ledPhase   = (uint8_t)(t * 3);
+    f.antenna    = ((int)(t * 1.2f) % 2) ? C::CYAN : C::CYAN_D;
+    float by = 1.6f * sinf(t * 2 * PI / 2.6f), jy = 0, tilt = 1.5f * sinf(t * 0.8f), hdx = 0;
+    float tailBase = -0.3f, tailWag = 0.35f, tailSpeed = 2 * PI * 1.4f, shadowK = 1.0f;
+    bool wave = false;
+    uint16_t core = mix(C::CYAN_D, C::CYAN, 0.5f + 0.5f * sinf(t * 3.0f));
+
+    switch (state) {
+        case IDLE:
+            break;
+        case WAVING:
+            f.eyes      = EYE_HAPPY;
+            f.mouthOpen = f.tongue = true;
+            f.pant      = 1.5f * sinf(t * 18);
+            f.earA      = 0.36f + 0.08f * sinf(t * 14);
+            f.blush     = 0.8f;
+            wave        = true;
+            tilt        = 6 * sinf(t * 2 * PI * 1.2f);
+            tailWag     = 0.7f;
+            tailSpeed   = 2 * PI * 4.5f;
+            tailBase    = -0.55f;
+            break;
+        case JUMPING: {
+            const float p = (el % 900) / 900.0f;
+            float h = 0;
+            if (p < 0.15f) by += 4 * (p / 0.15f);
+            else if (p < 0.75f) h = sinf((p - 0.15f) / 0.6f * PI);
+            else if (p < 0.9f) by += 4 * (1 - (p - 0.75f) / 0.15f);
+            jy          = -30 * h;
+            shadowK     = 1 - 0.35f * h;
+            f.eyes      = h > 0.2f ? EYE_HAPPY : EYE_NORMAL;
+            f.mouthOpen = true;
+            f.tongue    = h > 0.2f;
+            f.earA      = 0.22f + 0.4f * h;
+            f.earDrop   = -4 * h;
+            tailWag     = 0.6f;
+            tailSpeed   = 2 * PI * 4;
+            break;
+        }
+        case WAITING:
+            f.lookX   = 0.6f;
+            f.lookY   = -0.7f;
+            tilt      = 13 + 2 * sinf(t * 2.5f);
+            tailWag   = 0.25f;
+            tailSpeed = 2 * PI * 0.9f;
+            f.earA    = 0.3f;
+            break;
+        case WORKING:
+            f.eyes     = EYE_VISOR;
+            f.scan     = 0.5f + 0.5f * sinf(t * 4.5f);
+            f.antenna  = ((int)(t * 8) % 2) ? C::YELLOW : C::CYAN_D;
+            f.ledPhase = (uint8_t)(t * 10);
+            tilt       = 0;
+            core       = mix(C::CYAN_D, C::CYAN, 0.5f + 0.5f * sinf(t * 12));
+            tailWag    = 0.15f;
+            tailSpeed  = 2 * PI * 0.8f;
+            break;
+        case REVIEW:
+            f.eyes    = EYE_NARROW;
+            f.browUp  = true;
+            f.lookX   = sinf(t * 1.6f);
+            tilt      = -6;
+            tailWag   = 0.12f;
+            tailSpeed = 2 * PI * 0.5f;
+            break;
+        case FAILED:
+            f.eyes      = EYE_SAD;
+            f.sadMouth  = true;
+            f.lookY     = 0.6f;
+            f.earA      = 0.04f;
+            f.earDrop   = 8;
+            f.blush     = 0;
+            f.antenna   = ((int)(t * 2) % 2) ? C::RED : C::CYAN_D;
+            by         += 4;
+            tilt        = -3;
+            tailBase    = 0.35f;
+            tailWag     = 0.06f;
+            tailSpeed   = 2 * PI * 0.4f;
+            core        = mix(C::CYAN_D, C::RED, 0.4f + 0.3f * sinf(t * 2));
+            break;
+        case PETTED:
+            f.eyes      = EYE_HAPPY;
+            f.mouthOpen = f.tongue = true;
+            f.pant      = 1.5f * sinf(t * 16);
+            f.blush     = 1.0f;
+            f.earA      = 0.08f;
+            tilt        = 7 * sinf(t * 2 * PI * 0.9f);
+            tailWag     = 0.8f;
+            tailSpeed   = 2 * PI * 5.0f;
+            tailBase    = -0.55f;
+            core        = mix(C::PINK, C::WHITE, 0.3f + 0.3f * sinf(t * 6));
+            if (now - lastSpawn > 260) {
+                lastSpawn = now;
+                spawnHeart(160 + random(-70, 71), 60 + random(-10, 20));
+            }
+            break;
+        default:
+            break;
+    }
+    if (blinking && (f.eyes == EYE_NORMAL || f.eyes == EYE_SAD || f.eyes == EYE_NARROW)) f.eyes = EYE_BLINK;
+
+    // 描画
+    memcpy(canvas.getBuffer(), bg.getBuffer(), W * H * 2);
+    canvas.fillEllipse(160, 228, lroundf(66 * shadowK), 7, C::SHADOW);
+    drawBody(t, by + jy, tailBase, tailWag, tailSpeed, wave, core);
+    drawHead(f);
+    head.pushRotateZoom(&canvas, 160 + hdx, 92 + by + jy, tilt, 1.0f, 1.0f, C::TRANSP);
+    drawTag(lroundf(by + jy));
+
+    if (state == WAITING) {
+        canvas.fillSmoothCircle(214, 70, 4, C::WHITE);
+        canvas.fillSmoothCircle(226, 56, 7, C::WHITE);
+        canvas.fillSmoothCircle(252, 36, 22, C::WHITE);
+        canvas.setFont(&fonts::FreeSansBold18pt7b);
+        canvas.setTextDatum(middle_center);
+        canvas.setTextColor(C::PILL);
+        canvas.drawString("?", 253, 38 + lroundf(2 * sinf(t * 4)));
+    } else if (state == WORKING) {
+        drawGear(canvas, 262, 44, t * 2.0f);
+        for (int i = 0; i < 3; i++) {
+            const bool on = ((int)(t * 4) % 4) > i;
+            canvas.fillSmoothCircle(234 + i * 12, 84, 3, on ? C::CYAN : C::CYAN_D);
+        }
+    } else if (state == REVIEW) {
+        const int mx = 256 + lroundf(6 * sinf(t * 1.6f)), my = 48;
+        canvas.fillSmoothCircle(mx, my, 17, C::METAL);
+        canvas.fillSmoothCircle(mx, my, 12, mix(C::BG_TOP, C::CYAN, 0.25f));
+        canvas.drawWideLine(mx + 12, my + 12, mx + 26, my + 26, 4.0f, C::METAL);
+        canvas.fillSmoothCircle(mx - 4, my - 4, 3, C::WHITE);
+    } else if (state == FAILED) {
+        const int dy = (el / 12) % 26;
+        canvas.fillSmoothCircle(236, 70 + dy, 6, C::SWEAT);
+        canvas.fillTriangle(230, 68 + dy, 242, 68 + dy, 236, 56 + dy, C::SWEAT);
+    } else if (state == WAVING || state == JUMPING) {
+        const float s = 0.5f + 0.5f * sinf(t * 7);
+        sparkle(canvas, 60, 70, 2 + lroundf(2 * s), C::YELLOW);
+        sparkle(canvas, 262, 52, 2 + lroundf(2 * (1 - s)), C::YELLOW);
+        sparkle(canvas, 248, 110, 1 + lroundf(2 * s), C::WHITE);
+    }
+    drawParticles();
+    drawLabel();
+
+    canvas.pushSprite(0, 0);
+    updateLeds(t);
+
+    frames++;
+    if (now - fpsT > 10000) {
+        Serial.printf("[fps] %.1f state=%s\n", frames * 1000.0f / (now - fpsT), INFO[state].id);
+        frames = 0;
+        fpsT   = now;
+    }
+}

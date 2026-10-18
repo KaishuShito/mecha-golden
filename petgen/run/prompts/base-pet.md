@@ -1,0 +1,7 @@
+Create one clean full-body reference sprite for Codex pet Mecha Golden.
+
+Pet identity: very simple chunky low-resolution pixel art golden retriever puppy, round fluffy blob-like body sitting, soft golden-cream fur in 3-4 flat shades, tiny dark dot eyes and a tiny mouth, small floppy ears, a very short antenna with a small cyan tip on top of the head as its only robot detail, a tiny cyan heart on the chest; cute, calm, minimal like a tamagotchi.
+Style: Pet-safe sprite: compact full-body mascot, readable in a 192x208 cell, clear silhouette, simple face, stable palette/materials, and crisp edges for chroma-key extraction. Style `pixel`: Pixel-art-adjacent digital mascot with a chunky silhouette, simple dark outline, limited palette, flat cel shading, and visible stepped edges. User style notes: big visible pixels (the whole pet is only about 48 pixels tall before upscaling), limited palette, flat colors with one lighter highlight shade, no black outline or a very soft darker edge, no anti-aliasing, minimal face, cozy and cute like the reference: a soft blob creature on a dark screen.
+
+
+Place a single centered pose on a perfectly flat pure magenta #FF00FF chroma-key background. Keep the full pet visible, compact, readable at 192x208, and easy to animate. Preserve approved reference identity cues. No scenery, text, borders, checkerboard transparency, shadows, glows, detached effects, or extra props. Keep #FF00FF and close colors out of the pet, props, highlights, and effects.

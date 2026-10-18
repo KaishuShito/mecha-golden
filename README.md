@@ -5,7 +5,10 @@ OpenAI の **GPT-Live** (`gpt-live-1`) で声で会話し、**Decisions API** (`
 
 ![sprites](docs/images/sprites_sheet.png)
 
-> デモ動画: (近日追加)
+## デモ動画
+[![Mecha Golden demo](https://img.youtube.com/vi/X442Mk_te0g/hqdefault.jpg)](https://youtu.be/X442Mk_te0g)
+
+https://youtu.be/X442Mk_te0g
 
 ## できること
 - **声で会話** (GPT-Live): 頭のセンサーを 1 秒長押しで会話を始める。日本語の声 (harema)。英語で話しかけると英語で返す。天気やニュースは裏で web 検索
